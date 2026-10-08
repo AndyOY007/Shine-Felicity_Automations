@@ -11,18 +11,23 @@ They are undocumented and can change without notice.
 
     pip install requests pycryptodome
     export FELICITY_USER='you@example.com' FELICITY_PASS='...'
-    python3 felicity_probe.py            # summary line per device
-    python3 felicity_probe.py --raw      # full JSON, use this to map fields
-    python3 felicity_probe.py --sn 0205...  # one device only
-    python3 felicity_probe.py --limit 10    # first 10 devices only
-    python3 felicity_probe.py --plants      # one line per plant, from the device
+    python3 probe.py            # summary line per device
+    python3 probe.py --raw      # full JSON, use this to map fields
+    python3 probe.py --sn 0205...  # one device only
+    python3 probe.py --limit 10    # first 10 devices only
+    python3 probe.py --plants      # one line per plant, from the device
                                             # list only (no per-device calls)
-    python3 felicity_probe.py --plants --json   # same, machine-readable
-    python3 felicity_probe.py --list-plants # plantId, name, device count
-    python3 felicity_probe.py --watch watchlist.txt             # selected plants only
-    python3 felicity_probe.py --watch watchlist.txt --telegram  # and send the report
-    python3 felicity_probe.py --discover    # show a device-list row and the
-                                            # portal's plant-related endpoints
+    python3 probe.py --plants --json   # same, machine-readable
+    python3 probe.py --list-plants # plantId, name, device count
+    python3 probe.py --watch watchlist.txt             # selected plants only
+    python3 probe.py --watch watchlist.txt --telegram  # and send the report
+    python3 probe.py --discover    # show a device-list row and the
+                                   # portal's plant-related endpoints
+    python3 probe.py --telegram-chats   # list chat IDs the bot can see
+    python3 probe.py --telegram-test    # send a test message
+
+Settings are read from the environment, and from a `.env` file next to this
+script if one exists (KEY=VALUE lines; real environment variables win).
 
 Optional env:
     FELICITY_CA_BUNDLE   path to a PEM bundle if TLS verification fails
@@ -35,6 +40,7 @@ Watchlist file: one plant per line, either a plantId or a plant name
 """
 import argparse
 import base64
+import html
 import json
 import os
 import re
@@ -46,6 +52,28 @@ from urllib.parse import urljoin
 import requests
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
+
+
+
+def load_env_file(path: Path) -> None:
+    """Load KEY=VALUE lines from a .env file without overriding the real
+    environment, so cron and systemd need no shell wrapper."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        os.environ.setdefault(key.strip(), value)
+
+
+load_env_file(Path(__file__).resolve().parent / ".env")
 
 PORTAL_LOGIN = "https://shine.felicitysolar.com/login"
 API = "https://shine-api.felicitysolar.com"
@@ -154,7 +182,7 @@ class FelicityPortal:
         data = body.get("data")
         if not isinstance(data, dict) or not data.get("token"):
             # 1002006 = wrong password (or wrong RSA key), 1002001 = not activated
-            raise SystemExit(f"Login failed: code={body.get('code')} message={body.get('message')}")
+            raise RuntimeError(f"Felicity login failed: code={body.get('code')} message={body.get('message')}")
         token = data["token"]
         TOKEN_FILE.write_text(json.dumps({"user": self.user, "token": token, "exp": jwt_exp(token)}))
         TOKEN_FILE.chmod(0o600)
@@ -490,21 +518,79 @@ def format_plant(p: dict) -> str:
     return "\n".join(lines)
 
 
+# --- Telegram -----------------------------------------------------------------
+
+def tg_call(method: str, payload: dict | None = None) -> dict:
+    """Call the Telegram Bot API. Errors never include the request URL,
+    because the URL contains the bot token and would end up in logs."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/{method}",
+                          json=payload or {}, timeout=TIMEOUT)
+        body = r.json()
+    except requests.RequestException as err:
+        raise RuntimeError(f"Telegram {method}: {type(err).__name__} (network or timeout)") from None
+    except ValueError:
+        raise RuntimeError(f"Telegram {method}: HTTP {r.status_code}, non-JSON reply") from None
+    if not body.get("ok"):
+        hint = ""
+        moved = (body.get("parameters") or {}).get("migrate_to_chat_id")
+        if moved:
+            hint = f" (group became a supergroup; set TELEGRAM_CHAT_ID={moved})"
+        raise RuntimeError(
+            f"Telegram {method}: {body.get('error_code')} {body.get('description')}{hint}"
+        )
+    return body
+
+
 def send_telegram(text: str) -> None:
-    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+    """Send a plain-text report. Blocks are separated by blank lines; the first
+    line of each block is shown in bold, and blocks are never split."""
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if not chat:
+        raise RuntimeError("TELEGRAM_CHAT_ID is not set")
     chunks, current = [], ""
-    for block in text.split("\n\n"):  # keep each plant whole, stay under the 4096-char limit
-        if current and len(current) + len(block) + 2 > 3900:
+    for block in text.split("\n\n"):
+        head, _, rest = html.escape(block, quote=False).partition("\n")
+        block = f"<b>{head}</b>" + (f"\n{rest}" if rest else "")
+        if current and len(current) + len(block) + 2 > 3900:  # Telegram limit is 4096
             chunks.append(current)
             current = ""
         current = f"{current}\n\n{block}" if current else block
     chunks.append(current)
     for chunk in chunks:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          json={"chat_id": chat, "text": chunk}, timeout=TIMEOUT)
-        r.raise_for_status()
+        tg_call("sendMessage", {"chat_id": chat, "text": chunk, "parse_mode": "HTML",
+                                "disable_web_page_preview": True})
+
+
+def telegram_chats() -> int:
+    """Print the chats that have recently messaged the bot, to find the chat ID."""
+    me = tg_call("getMe")["result"]
+    print(f"bot: @{me.get('username')}")
+    chats: dict = {}
+    for upd in tg_call("getUpdates", {"timeout": 0}).get("result", []):
+        for key in ("message", "channel_post", "my_chat_member", "edited_message"):
+            chat = (upd.get(key) or {}).get("chat")
+            if chat:
+                chats[chat["id"]] = chat
+    if not chats:
+        print("No chats yet. Send /start to the bot (or add it to the group and send "
+              "/start there), then run this again.")
+        return 1
+    for cid, chat in chats.items():
+        name = chat.get("title") or " ".join(
+            x for x in (chat.get("first_name"), chat.get("last_name")) if x
+        ) or chat.get("username") or ""
+        print(f"{cid}\t{chat.get('type')}\t{name}")
+    return 0
+
+
+def telegram_test() -> int:
+    send_telegram(f"Felicity monitor test\nSent {time.strftime('%Y-%m-%d %H:%M')} from {os.uname().nodename}")
+    print("sent")
+    return 0
 
 
 def run_watch(portal: FelicityPortal, devices: list[dict], path: str, as_json: bool, telegram: bool) -> int:
@@ -517,7 +603,10 @@ def run_watch(portal: FelicityPortal, devices: list[dict], path: str, as_json: b
         report = json.dumps(plants, indent=2, ensure_ascii=False)
     else:
         header = f"Felicity watchlist, {time.strftime('%Y-%m-%d %H:%M')} ({len(plants)} plant(s))"
-        report = "\n\n".join([header] + [format_plant(p) for p in plants])
+        blocks = [header] + [format_plant(p) for p in plants]
+        if unmatched:
+            blocks.append("Not found in portal\n" + "\n".join(f"  {w}" for w in unmatched))
+        report = "\n\n".join(blocks)
     print(report)
     if telegram and not as_json:
         send_telegram(report)
@@ -582,8 +671,31 @@ def main() -> int:
     ap.add_argument("--telegram", action="store_true", help="with --watch: send the report to Telegram")
     ap.add_argument("--discover", action="store_true",
                     help="show one device-list row and plant-related portal endpoints")
+    ap.add_argument("--telegram-chats", action="store_true",
+                    help="list the chat IDs that have messaged the bot")
+    ap.add_argument("--telegram-test", action="store_true", help="send a test message")
     args = ap.parse_args()
 
+    if args.telegram_chats or args.telegram_test:
+        try:
+            return telegram_chats() if args.telegram_chats else telegram_test()
+        except RuntimeError as err:
+            log(f"FAILED: {err}")
+            return 1
+    try:
+        return run(args)
+    except (requests.RequestException, RuntimeError) as err:
+        # one notice per failed run, so a scheduled report never fails silently
+        log(f"FAILED: {type(err).__name__}: {err}")
+        if args.telegram:
+            try:
+                send_telegram(f"Felicity watchlist report failed\n{type(err).__name__}: {err}")
+            except RuntimeError as tg_err:
+                log(f"could not send the failure notice: {tg_err}")
+        return 1
+
+
+def run(args: argparse.Namespace) -> int:
     user, password = os.environ.get("FELICITY_USER"), os.environ.get("FELICITY_PASS")
     if not user or not password:
         print("Set FELICITY_USER and FELICITY_PASS", file=sys.stderr)
@@ -593,11 +705,7 @@ def main() -> int:
     if args.discover:
         discover(portal)
         return 0
-    try:
-        devices = portal.devices()
-    except (requests.RequestException, RuntimeError) as err:
-        log(f"FAILED: {type(err).__name__}: {err}")
-        return 1
+    devices = portal.devices()
     if args.list_plants:
         for pid, rows in sorted(group_by_plant(devices).items(), key=lambda kv: plant_name(kv[1]).lower()):
             print(f"{pid}\t{plant_name(rows)}\t{len(rows)} device(s)")

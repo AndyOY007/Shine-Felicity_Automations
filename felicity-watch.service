@@ -1,0 +1,25 @@
+# systemd unit for the Felicity watchlist scheduler.
+# Assumes user translight-iot and the project at /home/translight-iot/shine-felicity
+# with a virtualenv in .venv. Change the three paths below if yours differ.
+#
+#   sudo cp felicity-watch.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now felicity-watch
+#   journalctl -u felicity-watch -f
+
+[Unit]
+Description=Felicity watchlist Telegram reports
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=translight-iot
+WorkingDirectory=/home/translight-iot/shine-felicity
+ExecStart=/home/translight-iot/shine-felicity/.venv/bin/python /home/translight-iot/shine-felicity/scheduler.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

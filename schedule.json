@@ -1,0 +1,6 @@
+{
+  "timezone": "Africa/Accra",
+  "watchlist": "watchlist.txt",
+  "weekdays": {"start": "07:00", "end": "19:00", "interval_minutes": 60},
+  "weekends": {"start": "08:00", "end": "18:00", "interval_minutes": 120}
+}
