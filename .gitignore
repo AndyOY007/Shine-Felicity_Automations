@@ -2,3 +2,8 @@
 watchlist.txt
 felicity_probe.txt
 .env
+.gitignore
+.idea
+__pychache__
+plants.json
+

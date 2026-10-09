@@ -158,11 +158,16 @@ class DemoSource:
         t = time.time() / 20.0
         wave = 0.5 + 0.5 * math.sin(t + hash(pid) % 7)
         plant = {"plantId": pid, "plant": name, "inverters": inv, "batteries": batt,
-                 "status": f"NMx{inv + batt}", "mode": "Off-Grid Mode", "warnings": [], "errors": []}
+                 "status": f"NMx{inv + batt}", "mode": "Off-Grid Mode", "warnings": [], "errors": [],
+                 "batt_capacity_unknown": 0, "reserve_pct": 20.0,
+                 "offline": False, "offline_devices": [], "last_data": None}
         if kind == "dead":
             plant.update(pv_W=None, load_W=None, grid_in_W=None, batt_W=None, soc_avg=None,
                          soc_min=None, pv_today_kWh=None, mode=None, status="OLx2",
-                         errors=["020306004825200179: code=500 message=no data"])
+                         batt_rated_kWh=None, batt_remaining_kWh=None, backup_h=None,
+                         offline=True, last_data="2026-08-04 02:25", offline_devices=[
+                             {"sn": "020306004825200179", "model": "IVEM6048", "kind": "inverter",
+                              "since": "2026-08-04 02:25"}])
             return plant
         pv = round(9000 * wave) if kind != "low" else 0
         load = round(1800 + 2500 * (1 - wave))
@@ -173,9 +178,15 @@ class DemoSource:
         if kind in ("import", "export"):
             plant["mode"] = "Line Mode"
         if kind == "low":
-            plant.update(soc_avg=17.0, soc_min=14.0, pv_today_kWh=0.4)
+            plant.update(soc_avg=17.0, soc_min=14.0, pv_today_kWh=0.4, offline_devices=[
+                {"sn": "073004850025270356", "model": "FLA48500", "kind": "battery", "since": "2026-10-06 09:10"}])
         if kind == "warn":
             plant["warnings"] = ["020308004825210463: PV2 low voltage"]
+            plant["batt_capacity_unknown"] = 1
+        rated = 10.0 * batt
+        remaining = rated * plant["soc_avg"] / 100
+        plant.update(batt_rated_kWh=rated, batt_remaining_kWh=round(remaining, 1),
+                     backup_h=round(max(remaining - rated * 0.2, 0) / (load / 1000), 1))
         return plant
 
 

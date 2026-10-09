@@ -34,6 +34,8 @@ Optional env:
     FELICITY_PUBKEY      base64 RSA public key, skips scraping it from the portal
     FELICITY_TOKEN_FILE  token cache path (default ~/.felicity_token.json)
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   required for --telegram
+    BATTERY_RESERVE_PCT  state of charge treated as empty when estimating
+                         backup time (default 20)
 
 Watchlist file: one plant per line, either a plantId or a plant name
 (case-insensitive; exact match first, then substring). `#` starts a comment.
@@ -307,7 +309,8 @@ def watts(row: dict, key: str) -> float | None:
 
 
 def is_battery(row: dict) -> bool:
-    return str(row.get("deviceType") or "").upper() == "BP"
+    """Battery devices carry a battery capacity in the device list; inverter rows leave it null."""
+    return str(row.get("deviceType") or "").upper() == "BP" or row.get("battCapacity") is not None
 
 
 def has_live(row: dict) -> bool:
@@ -436,6 +439,98 @@ def match_plants(groups: dict[str, list[dict]], wanted: list[str]) -> tuple[list
     return matched, unmatched
 
 
+NOMINAL_PACK_V = 51.2                 # 16-cell LFP module
+MODEL_AH = re.compile(r"48(\d{3})")   # FLA48500TG2 -> 500 Ah
+STALE_AFTER_S = 12 * 3600             # see device_offline()
+
+
+def reserve_pct() -> float:
+    try:
+        return min(max(float(os.environ.get("BATTERY_RESERVE_PCT", "20")), 0.0), 95.0)
+    except ValueError:
+        return 20.0
+
+
+def positive(v) -> float | None:
+    v = num(v)
+    return v if v and v > 0 else None
+
+
+def module_count(snap: dict) -> int:
+    """Battery modules in series inside one device: 1 for a 48 V pack, 10 for a
+    typical high-voltage stack (FLH series).
+
+    The stack voltage divided by the module voltage gives a rough count, which
+    drifts with state of charge, so an explicit count from the snapshot is used
+    when it agrees with that ratio to within 25 %.
+    """
+    volt = positive(snap.get("volt")) or NOMINAL_PACK_V
+    stack_v = positive(first(snap, "battVolt", "emsVoltage"))
+    listed = snap.get("bmsVoltageList")
+    listed = sum(1 for v in map(num, listed) if v and 20 < v < 100) if isinstance(listed, list) else 0
+    if stack_v is None:
+        return listed if listed >= 2 and listed == num(snap.get("batCount")) else 1
+    ratio = stack_v / volt
+    if ratio < 1.5:
+        return 1
+    for count in (listed, num(snap.get("batCount")), num(snap.get("cellNumber"))):
+        if count and 0.75 * ratio <= count <= 1.25 * ratio:
+            return int(count)
+    return max(round(ratio), 1)
+
+
+def battery_energy(snap: dict, row: dict) -> dict:
+    """Rated and stored energy of one battery device.
+
+    Felicity's `ratedEnergy` is per module, so a high-voltage stack is
+    `ratedEnergy` x modules in series. Stored energy is rated x present state
+    of charge; the portal's own `remainingBatteryEnergy` is not used because it
+    is often missing or stale.
+    """
+    modules = module_count(snap)
+    per_module = positive(snap.get("ratedEnergy"))
+    source = None
+    if per_module and per_module > 1000:  # reported in Wh
+        per_module /= 1000
+    if per_module:
+        source = f"{per_module:g} kWh reported"
+    else:
+        ah = next((a for a in (positive(snap.get(k)) for k in
+                               ("capacity", "battCapacity", "emsCapacity", "totalEmsCapacity")) if a), None)
+        ah = ah or positive(row.get("battCapacity"))
+        from_model = False
+        if ah is None:
+            m = MODEL_AH.search(str(row.get("deviceModel") or ""))
+            ah, from_model = (float(m.group(1)), True) if m else (None, False)
+        if ah:
+            volt = positive(snap.get("volt")) or NOMINAL_PACK_V
+            per_module = ah * volt / 1000
+            source = f"{ah:g} Ah {'from the model name' if from_model else 'reported'} x {volt:g} V"
+    rated = per_module * modules if per_module else None
+    if rated and modules > 1:
+        source += f" per module x {modules} modules in series"
+    soc = num(first(snap, "emsSoc", "battSoc"))
+    return {"rated": rated, "modules": modules, "rated_from": source,
+            "remaining": rated * soc / 100 if rated is not None and soc is not None else None}
+
+
+def device_offline(snap: dict, row: dict) -> tuple[bool, str | None]:
+    """(offline?, time of the device's last data as the portal shows it).
+
+    The portal keeps serving the last snapshot of a device that has stopped
+    reporting, so offline devices must be excluded from live totals. Status
+    "OL" is the portal's own offline flag. The age check is a backstop only:
+    the snapshot's epoch can be 8 hours off (device time is stored as UTC+8),
+    so anything under 12 hours is not judged by age.
+    """
+    stamp = first(snap, "dataTimeStr")
+    stamp = str(stamp)[:16] if stamp else None
+    status = str(first(snap, "status") or row.get("status") or "").upper()
+    epoch_ms = num(snap.get("dataTime"))
+    too_old = epoch_ms is not None and time.time() - epoch_ms / 1000 > STALE_AFTER_S
+    return status == "OL" or too_old, stamp
+
+
 def unit_factor(row: dict) -> float:
     """Snapshots carry no unit, so use the unit the device list declares for
     this device (IVGM models report kW, IVEM and T-REX report W)."""
@@ -444,16 +539,33 @@ def unit_factor(row: dict) -> float:
 
 def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
     devices = [r for r in rows if r.get("deviceSn") and not SUB_ENTRY.search(r["deviceSn"])]
-    inverters, packs, warnings, errors = [], [], [], []
+    inverters, packs, warnings, errors, detail, offline = [], [], [], [], [], []
+    pack_count = pack_errors = 0
     for r in devices:
         sn = r["deviceSn"]
         try:
             snap = portal.snapshot(sn)
         except (requests.RequestException, RuntimeError, ValueError) as err:
             errors.append(f"{sn}: {err}")
+            pack_count += is_battery(r)
+            pack_errors += is_battery(r)
+            detail.append({"sn": sn, "model": r.get("deviceModel"), "error": str(err),
+                           "kind": "battery" if is_battery(r) else "inverter"})
             continue
         finally:
             time.sleep(POLITE_DELAY_S)
+        is_pack = is_battery(r) or first(snap, "productTypeEnum") == "LITHIUM_BATTERY_PACK"
+        pack_count += is_pack
+        model = first(snap, "deviceModel", "modelName") or r.get("deviceModel")
+        entry = {"sn": sn, "model": model, "kind": "battery" if is_pack else "inverter"}
+        detail.append(entry)
+
+        gone, stamp = device_offline(snap, r)
+        entry.update(offline=gone, data_time=stamp)
+        if gone:  # last values of a device that stopped reporting: never mix into live totals
+            offline.append({"sn": sn, "model": model, "kind": entry["kind"], "since": stamp})
+            continue
+
         k = unit_factor(r)
 
         def w(*keys):
@@ -461,7 +573,8 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
             return None if v is None else v * k
 
         mode = first(snap, "workModeStr", "operMStr")
-        (packs if is_battery(r) else inverters).append({
+        energy = battery_energy(snap, r) if is_pack else {"rated": None, "remaining": None}
+        rec = {
             "pv": w("pvTotalPower", "pvPower"),
             "grid": w("acTtlInpower"),
             "load": w("totalConsumPower", "acTotalOutActPower"),
@@ -469,25 +582,60 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
             "soc": num(first(snap, "emsSoc", "battSoc")),
             "pv_today": num(first(snap, "ePvToday", "epvToday", "eToday", "etoday")),
             "mode": mode if mode not in (None, "-") else None,
-        })
+            "rated": energy["rated"],
+            "remaining": energy["remaining"],
+        }
+        (packs if is_pack else inverters).append(rec)
         if first(snap, "warnMsg"):
             warnings.append(f"{sn}: {first(snap, 'warnMsg')}")
+        # per-device breakdown, so every plant total can be traced to its inputs
+        entry.update(soc=rec["soc"], batt_W=rec["batt"])
+        if is_pack:
+            entry.update(rated_kWh=energy["rated"], stored_kWh=energy["remaining"],
+                         modules=energy["modules"], rated_from=energy["rated_from"],
+                         reported={key: snap.get(key) for key in
+                                   ("ratedEnergy", "capacity", "volt", "battVolt", "batCount", "cellNumber",
+                                    "remainingBatteryEnergy", "battSoh")})
+        else:
+            entry.update(pv_W=rec["pv"], load_W=rec["load"], grid_in_W=rec["grid"], pv_today_kWh=rec["pv_today"])
 
     def total(recs, key):
         vals = [x[key] for x in recs if x[key] is not None]
         return sum(vals) if vals else None
 
     batt = total(inverters, "batt")
-    soc = [x["soc"] for x in packs if x["soc"] is not None] or [x["soc"] for x in inverters if x["soc"] is not None]
+    soc = [x["soc"] for x in packs if x["soc"] is not None]
+    if not soc:
+        soc = [x["soc"] for x in inverters if x["soc"] is not None]
+        if pack_count == 0 and not any(soc):
+            soc = []  # an inverter with no battery data link reports 0 %, which is not a reading
+    load = total(inverters, "load")
+    rated, remaining = total(packs, "rated"), total(packs, "remaining")
+    # Backup time: energy above the reserve level divided by the present load,
+    # i.e. how long the bank would last if solar and grid stopped now.
+    reserve, backup = reserve_pct(), None
+    if rated and remaining is not None and load and load >= 50:
+        backup = round(max(remaining - rated * reserve / 100, 0) / (load / 1000), 1)
+    stamps = sorted(o["since"] for o in offline if o["since"])
     return {
         "plantId": pid,
         "plant": plant_name(rows),
-        "inverters": sum(not is_battery(r) for r in devices),
-        "batteries": sum(is_battery(r) for r in devices),
+        "inverters": len(devices) - pack_count,
+        "batteries": pack_count,
+        # True when no device in the plant is reporting
+        "offline": bool(offline) and not inverters and not packs,
+        "offline_devices": offline,
+        "last_data": stamps[-1] if stamps else None,
+        "batt_rated_kWh": None if rated is None else round(rated, 1),
+        "batt_remaining_kWh": None if remaining is None else round(remaining, 1),
+        # online packs with no usable capacity figure, plus packs that returned an error
+        "batt_capacity_unknown": sum(x["rated"] is None for x in packs) + pack_errors,
+        "backup_h": backup,
+        "reserve_pct": reserve,
         "status": tally(r.get("status") for r in devices),
         "mode": ", ".join(sorted({x["mode"] for x in inverters if x["mode"]})) or None,
         "pv_W": total(inverters, "pv"),
-        "load_W": total(inverters, "load"),
+        "load_W": load,
         "grid_in_W": total(inverters, "grid"),
         "batt_W": batt if batt is not None else total(packs, "batt"),
         "soc_avg": round(sum(soc) / len(soc), 1) if soc else None,
@@ -495,6 +643,7 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
         "pv_today_kWh": total(inverters, "pv_today"),
         "warnings": warnings,
         "errors": errors,
+        "devices": detail,
     }
 
 
@@ -502,17 +651,30 @@ def format_plant(p: dict) -> str:
     def kw(v):
         return "-" if v is None else f"{v / 1000:.2f} kW"
 
-    batt = p["batt_W"]
-    # positive battery power = charging (inferred from live data, not documented)
-    flow = "" if not batt else (" charging" if batt > 0 else " discharging")
-    soc = "-" if p["soc_avg"] is None else f"{p['soc_avg']:.0f}% (min {p['soc_min']:.0f}%)"
-    today = "-" if p["pv_today_kWh"] is None else f"{p['pv_today_kWh']:.1f} kWh"
-    lines = [
-        f"{p['plant']}  [{p['inverters']} inv, {p['batteries']} batt, status {p['status']}]",
-        f"  PV {kw(p['pv_W'])} | Load {kw(p['load_W'])} | Grid in {kw(p['grid_in_W'])} | "
-        f"Battery {kw(abs(batt) if batt is not None else None)}{flow}",
-        f"  SOC {soc} | PV today {today} | Mode {p['mode'] or '-'}",
-    ]
+    lines = [f"{p['plant']}  [{p['inverters']} inv, {p['batteries']} batt, status {p['status']}]"]
+    if p.get("offline"):
+        lines.append(f"  OFFLINE, last data {p.get('last_data') or 'unknown'}")
+    else:
+        batt = p["batt_W"]
+        # positive battery power = charging (inferred from live data, not documented)
+        flow = "" if not batt else (" charging" if batt > 0 else " discharging")
+        soc = "-" if p["soc_avg"] is None else f"{p['soc_avg']:.0f}% (min {p['soc_min']:.0f}%)"
+        today = "-" if p["pv_today_kWh"] is None else f"{p['pv_today_kWh']:.1f} kWh"
+        lines += [
+            f"  PV {kw(p['pv_W'])} | Load {kw(p['load_W'])} | Grid in {kw(p['grid_in_W'])} | "
+            f"Battery {kw(abs(batt) if batt is not None else None)}{flow}",
+            f"  SOC {soc} | PV today {today} | Mode {p['mode'] or '-'}",
+        ]
+        rated, remaining = p.get("batt_rated_kWh"), p.get("batt_remaining_kWh")
+        if rated:
+            line = f"  Stored {'-' if remaining is None else format(remaining, '.1f')} of {rated:.1f} kWh"
+            if p.get("backup_h") is not None:
+                line += f" | Backup ~{p['backup_h']:.1f} h at this load (to {p['reserve_pct']:.0f}%)"
+            if p.get("batt_capacity_unknown"):
+                line += f" | capacity unknown for {p['batt_capacity_unknown']} pack(s)"
+            lines.append(line)
+        lines += [f"  OFFLINE {o['kind']} {o['model'] or ''} {o['sn']}, last data {o['since'] or 'unknown'}"
+                  for o in p.get("offline_devices") or []]
     lines += [f"  WARNING {w}" for w in p["warnings"]]
     lines += [f"  NO DATA {e}" for e in p["errors"]]
     return "\n".join(lines)
@@ -705,7 +867,8 @@ def run(args: argparse.Namespace) -> int:
     if args.discover:
         discover(portal)
         return 0
-    devices = portal.devices()
+    single = args.sn and not (args.list_plants or args.watch or args.plants)
+    devices = [] if single else portal.devices()  # one device needs no list sweep
     if args.list_plants:
         for pid, rows in sorted(group_by_plant(devices).items(), key=lambda kv: plant_name(kv[1]).lower()):
             print(f"{pid}\t{plant_name(rows)}\t{len(rows)} device(s)")
@@ -715,7 +878,7 @@ def run(args: argparse.Namespace) -> int:
     if args.plants:
         print_plants(devices, args.json)
         return 0
-    if args.raw:
+    if args.raw and not single:
         print(json.dumps({"devices": devices}, indent=2, ensure_ascii=False))
     sns = [d["deviceSn"] for d in devices if d.get("deviceSn")]
     if args.sn:
