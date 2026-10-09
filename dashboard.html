@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Felicity plants</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --page: #1b1e23;
+    --panel: #262a30;
+    --rule: #3a4048;
+    --line: #4b525c;
+    --ink: #f3f4f6;
+    --ink-2: #b3b9c2;
+    --ink-3: #8f96a0;
+    /* identity colours: one per energy source, validated for colour-blind separation */
+    --pv: #c98500;
+    --grid: #3987e5;
+    --batt: #008300;
+    --load: #d55181;
+    /* status colours: always shown with an icon and a word */
+    --good: #0ca30c;
+    --warn: #fab219;
+    --crit: #e0504f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 15px/1.45 "Avenir Next", "Segoe UI Variable Text", "Segoe UI", "Noto Sans", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1680px; margin: 0 auto; padding: 20px 16px 48px; }
+
+  .top { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 24px; }
+  h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+  .fresh { color: var(--ink-2); font-size: 14px; font-variant-numeric: tabular-nums; }
+  .fresh b { color: var(--ink); font-weight: 600; }
+
+  .notice {
+    margin-top: 14px; padding: 10px 14px; border: 1px solid var(--rule); border-left: 3px solid var(--warn);
+    background: var(--panel); border-radius: 6px; color: var(--ink-2); font-size: 14px; overflow-wrap: anywhere;
+  }
+  .notice + .notice { margin-top: 8px; }
+  .notice b { color: var(--ink); font-weight: 600; }
+
+  .totals {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    margin-top: 18px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+  }
+  .total { padding: 12px 18px 12px 0; }
+  .total-label { color: var(--ink-2); font-size: 13px; }
+  .total-value { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; }
+  .total-value small { font-size: 15px; font-weight: 500; color: var(--ink-2); margin-left: 3px; }
+
+  .plants {
+    display: grid; gap: 14px; margin-top: 18px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr));
+  }
+  .plant { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px 14px; min-width: 0; }
+  .plant-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .plant-name { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+  .plant-meta { margin: 2px 0 0; color: var(--ink-2); font-size: 13px; min-height: 19px; }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; flex: none; white-space: nowrap;
+    padding: 3px 10px 3px 8px; border: 1px solid var(--rule); border-radius: 999px; font-size: 13px; color: var(--ink);
+  }
+  .chip svg { width: 14px; height: 14px; color: var(--ink-3); }
+  .plant[data-state="ok"] .chip svg { color: var(--good); }
+  .plant[data-state="check"] .chip svg { color: var(--warn); }
+  .plant[data-state="nodata"] .chip svg { color: var(--crit); }
+
+  .flow { display: block; width: 100%; height: auto; margin: 14px 0 6px; overflow: visible; }
+  .flow text { fill: var(--ink); font-family: inherit; }
+  .flow .n-label { fill: var(--ink-2); font-size: 14px; }
+  .flow .n-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .flow .wire { fill: none; stroke: var(--line); stroke-width: 2; }
+  .flow .dots { fill: none; stroke-width: 4.5; stroke-linecap: round; stroke-dasharray: 0.1 14; opacity: 0; }
+  .flow .dots.on { opacity: 1; animation: run 1.1s linear infinite; }
+  .flow .dots.on.rev { animation-direction: reverse; }
+  @keyframes run { to { stroke-dashoffset: -14.1; } }
+  .flow .pv { color: var(--pv); stroke: var(--pv); }
+  .flow .gr { color: var(--grid); stroke: var(--grid); }
+  .flow .ba { color: var(--batt); stroke: var(--batt); }
+  .flow .lo { color: var(--load); stroke: var(--load); }
+  .flow .icon { fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+  .flow .node.off { opacity: 0.45; }
+  .flow .inv { fill: #e6e9ed; }
+  .flow .inv-screen { fill: #2b2f36; }
+  .plant[data-state="nodata"] .flow .inv, .plant[data-state="pending"] .flow .inv { fill: #6b727c; }
+  @media (prefers-reduced-motion: reduce) {
+    .flow .dots.on { animation: none; stroke-dasharray: none; stroke-width: 2.5; }
+  }
+
+  .foot { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: end; border-top: 1px solid var(--rule); padding-top: 12px; }
+  .foot-label { color: var(--ink-2); font-size: 13px; }
+  .foot-value { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .foot-value small { font-size: 13px; font-weight: 400; color: var(--ink-2); margin-left: 6px; }
+  .today { text-align: right; }
+  .meter { --fill: var(--batt); height: 6px; margin-top: 6px; border-radius: 3px; overflow: hidden;
+           background: color-mix(in srgb, var(--fill) 26%, var(--panel)); }
+  .meter i { display: block; height: 100%; width: 0; border-radius: 3px; background: var(--fill); transition: width 0.6s ease; }
+
+  .issues { list-style: none; margin: 12px 0 0; padding: 0; font-size: 13px; color: var(--ink-2); }
+  .issues:empty { display: none; }
+  .issues li { padding-left: 14px; position: relative; overflow-wrap: anywhere; }
+  .issues li::before { content: ""; position: absolute; left: 0; top: 0.55em; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); }
+  .issues li + li { margin-top: 3px; }
+
+  .empty { margin-top: 28px; color: var(--ink-2); max-width: 60ch; }
+  .empty code { color: var(--ink); font-size: 14px; }
+  @media (max-width: 480px) {
+    .foot { grid-template-columns: 1fr; } .today { text-align: left; }
+    .flow .n-label { font-size: 17px; } .flow .n-value { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-solar" viewBox="0 0 40 40"><path d="M9 9H31L36 27H4Z M20 9V27 M6.5 18H33.5 M20 27V33 M14 33H26"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 40 40"><path d="M20 4L11 36 M20 4L29 36 M7 13H33 M10.5 21H29.5 M15.5 21L27.4 30.4 M24.5 21L12.6 30.4"/></symbol>
+  <symbol id="i-battery" viewBox="0 0 40 40"><path d="M11 9H29A2 2 0 0 1 31 11V33A2 2 0 0 1 29 35H11A2 2 0 0 1 9 33V11A2 2 0 0 1 11 9Z M16 9V5H24V9"/><path d="M22 14L15.5 23H20L18 30L24.5 21H20Z" fill="currentColor" stroke-width="1"/></symbol>
+  <symbol id="i-load" viewBox="0 0 40 40"><path d="M5 19L20 6L35 19 M9.5 16V34H30.5V16 M16.5 34V24.5H23.5V34"/></symbol>
+  <symbol id="i-ok" viewBox="0 0 14 14"><circle cx="7" cy="7" r="7" fill="currentColor"/><path d="M3.8 7.2L6 9.4L10.2 4.9" fill="none" stroke="#14171b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-check" viewBox="0 0 14 14"><path d="M7 0.8L13.6 12.8H0.4Z" fill="currentColor"/><path d="M7 5V8.6 M7 10.6V10.7" stroke="#14171b" stroke-width="1.7" stroke-linecap="round"/></symbol>
+  <symbol id="i-nodata" viewBox="0 0 14 14"><circle cx="7" cy="7" r="7" fill="currentColor"/><path d="M4.5 4.5L9.5 9.5 M9.5 4.5L4.5 9.5" stroke="#14171b" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-pending" viewBox="0 0 14 14"><circle cx="7" cy="7" r="6" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3 3"/></symbol>
+</svg>
+
+<div class="wrap">
+  <header class="top">
+    <h1>Felicity plants</h1>
+    <div class="fresh" id="fresh" role="status">Loading plants</div>
+  </header>
+  <div id="notices"></div>
+
+  <section class="totals" aria-label="Totals across the watchlist">
+    <div class="total"><div class="total-label">Solar now</div><div class="total-value" id="t-pv">&ndash;</div></div>
+    <div class="total"><div class="total-label">Load now</div><div class="total-value" id="t-load">&ndash;</div></div>
+    <div class="total"><div class="total-label" id="t-batt-label">Battery</div><div class="total-value" id="t-batt">&ndash;</div></div>
+    <div class="total"><div class="total-label">Plants reporting</div><div class="total-value" id="t-count">&ndash;</div></div>
+  </section>
+
+  <main class="plants" id="plants"></main>
+  <p class="empty" id="empty" hidden></p>
+</div>
+
+<template id="plant-tpl">
+  <article class="plant" data-state="pending">
+    <header class="plant-head">
+      <h2 class="plant-name"></h2>
+      <span class="chip"><svg><use href="#i-pending"/></svg><span class="chip-label">Loading</span></span>
+    </header>
+    <p class="plant-meta"></p>
+    <svg class="flow" viewBox="0 0 480 212" role="img">
+      <path class="wire" d="M28 54V86Q28 96 38 96H212"/>
+      <path class="wire" d="M350 54V86Q350 96 340 96H268"/>
+      <path class="wire" d="M28 158V126Q28 116 38 116H212"/>
+      <path class="wire" d="M268 116H340Q350 116 350 126V158"/>
+      <path class="dots pv" data-flow="pv" d="M28 54V86Q28 96 38 96H212"/>
+      <path class="dots gr" data-flow="grid" d="M350 54V86Q350 96 340 96H268"/>
+      <path class="dots ba" data-flow="batt" d="M28 158V126Q28 116 38 116H212"/>
+      <path class="dots lo" data-flow="load" d="M268 116H340Q350 116 350 126V158"/>
+      <rect class="inv" x="212" y="78" width="56" height="56" rx="12"/>
+      <rect class="inv-screen" x="231" y="102" width="18" height="8" rx="2"/>
+      <g class="node" data-node="pv">
+        <use class="icon pv" href="#i-solar" x="8" y="6" width="40" height="40"/>
+        <text class="n-label" x="60" y="22">Solar</text><text class="n-value" x="60" y="46">&ndash;</text>
+      </g>
+      <g class="node" data-node="grid">
+        <use class="icon gr" href="#i-grid" x="330" y="6" width="40" height="40"/>
+        <text class="n-label" x="382" y="22">Grid</text><text class="n-value" x="382" y="46">&ndash;</text>
+      </g>
+      <g class="node" data-node="batt">
+        <use class="icon ba" href="#i-battery" x="8" y="164" width="40" height="40"/>
+        <text class="n-label" x="60" y="180">Battery</text><text class="n-value" x="60" y="204">&ndash;</text>
+      </g>
+      <g class="node" data-node="load">
+        <use class="icon lo" href="#i-load" x="330" y="164" width="40" height="40"/>
+        <text class="n-label" x="382" y="180">Load</text><text class="n-value" x="382" y="204">&ndash;</text>
+      </g>
+    </svg>
+    <div class="foot">
+      <div>
+        <div class="foot-label">Battery charge</div>
+        <div class="foot-value"><span class="soc-value">&ndash;</span><small class="soc-note"></small></div>
+        <div class="meter"><i></i></div>
+      </div>
+      <div class="today">
+        <div class="foot-label">Solar today</div>
+        <div class="foot-value today-value">&ndash;</div>
+      </div>
+    </div>
+    <ul class="issues"></ul>
+  </article>
+</template>
+
+<script>
+(() => {
+  const FLOW_MIN_W = 10;      // below this a line is shown as idle
+  const LOW_SOC = 20;         // lowest pack below this marks the plant "Check"
+  const POLL_MS = 5000;       // how often the page asks the dashboard server (not Felicity)
+  const $ = id => document.getElementById(id);
+  const cards = new Map();
+  let last = null, lastAt = 0, offline = false;
+
+  const power = v => {
+    if (v == null) return ["–", ""];
+    const a = Math.abs(v);
+    return a >= 1000 ? [(a / 1000).toFixed(a >= 100000 ? 0 : a >= 10000 ? 1 : 2), "kW"] : [String(Math.round(a)), "W"];
+  };
+  const powerText = v => power(v).join(" ").trim();
+  const clock = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+  function stateOf(p) {
+    if (p.pending) return "pending";
+    if ([p.pv_W, p.load_W, p.batt_W, p.soc_avg].every(v => v == null)) return "nodata";
+    if ((p.warnings || []).length || (p.errors || []).length) return "check";
+    if (p.soc_min != null && p.soc_min < LOW_SOC) return "check";
+    return "ok";
+  }
+  const CHIP = { pending: ["i-pending", "Loading"], ok: ["i-ok", "Reporting"], check: ["i-check", "Check"], nodata: ["i-nodata", "No data"] };
+
+  function makeCard(p) {
+    const el = $("plant-tpl").content.firstElementChild.cloneNode(true);
+    const q = s => el.querySelector(s);
+    const node = k => q(`[data-node="${k}"]`);
+    const card = { el, name: q(".plant-name"), meta: q(".plant-meta"), chipIcon: q(".chip use"), chipLabel: q(".chip-label"),
+      svg: q(".flow"), soc: q(".soc-value"), socNote: q(".soc-note"), meter: q(".meter"), bar: q(".meter i"),
+      today: q(".today-value"), issues: q(".issues"), nodes: {}, flows: {} };
+    for (const k of ["pv", "grid", "batt", "load"]) {
+      card.nodes[k] = { g: node(k), label: node(k).querySelector(".n-label"), value: node(k).querySelector(".n-value") };
+      card.flows[k] = q(`[data-flow="${k}"]`);
+    }
+    return card;
+  }
+
+  function setNode(card, key, label, watts, reverse) {
+    const n = card.nodes[key], f = card.flows[key];
+    n.label.textContent = label;
+    n.value.textContent = powerText(watts);
+    n.g.classList.toggle("off", watts == null);
+    const on = watts != null && Math.abs(watts) >= FLOW_MIN_W;
+    f.classList.toggle("on", on);
+    f.classList.toggle("rev", on && reverse);
+  }
+
+  function update(card, p, s) {
+    const st = stateOf(p);
+    card.el.dataset.state = st;
+    card.name.textContent = p.plant || p.plantId;
+    card.chipIcon.setAttribute("href", "#" + CHIP[st][0]);
+    card.chipLabel.textContent = CHIP[st][1];
+
+    const meta = [];
+    if (p.mode) meta.push(p.mode);
+    if (p.inverters != null) meta.push(plural(p.inverters, "inverter"));
+    if (p.batteries) meta.push(plural(p.batteries, "battery pack"));
+    card.meta.textContent = meta.join(", ");
+
+    const g = p.grid_in_W, b = p.batt_W;
+    const flowing = v => v != null && Math.abs(v) >= FLOW_MIN_W;
+    // Sign conventions: grid power is positive when importing; battery power is positive when charging.
+    setNode(card, "pv", "Solar", p.pv_W, false);
+    setNode(card, "grid", !flowing(g) ? "Grid" : g > 0 ? "Grid import" : "Grid export", g, g < 0);
+    setNode(card, "batt", !flowing(b) ? "Battery" : b > 0 ? "Charging" : "Discharging", b, b > 0);
+    setNode(card, "load", "Load", p.load_W, false);
+    card.svg.setAttribute("aria-label", st === "pending" ? "Waiting for data" :
+      `Solar ${powerText(p.pv_W)}, ${card.nodes.grid.label.textContent.toLowerCase()} ${powerText(g)}, ` +
+      `${card.nodes.batt.label.textContent.toLowerCase()} ${powerText(b)}, load ${powerText(p.load_W)}`);
+
+    const soc = p.soc_avg, low = p.soc_min;
+    card.soc.textContent = soc == null ? "–" : Math.round(soc) + "%";
+    card.socNote.textContent = soc != null && low != null && Math.round(soc) - Math.round(low) >= 1 ? `lowest pack ${Math.round(low)}%` : "";
+    card.bar.style.width = soc == null ? "0" : Math.max(0, Math.min(100, soc)) + "%";
+    const floor = low != null ? low : soc;
+    card.meter.style.setProperty("--fill", floor == null ? "var(--line)" : floor < 10 ? "var(--crit)" : floor < LOW_SOC ? "var(--warn)" : "var(--batt)");
+    card.today.textContent = p.pv_today_kWh == null ? "–" : p.pv_today_kWh.toFixed(1) + " kWh";
+
+    const issues = [];
+    if (low != null && low < LOW_SOC) issues.push(`Lowest battery pack is at ${Math.round(low)}%`);
+    for (const w of p.warnings || []) issues.push(w);
+    for (const e of p.errors || []) issues.push("No data from " + e);
+    if (p.fetched && s.now - p.fetched > 3 * s.refresh_s + 60) issues.push(`These values are from ${clock(p.fetched)}`);
+    card.issues.replaceChildren(...issues.map(t => Object.assign(document.createElement("li"), { textContent: t })));
+    return st;
+  }
+
+  function figure(el, watts) {
+    const [n, unit] = power(watts);
+    el.replaceChildren(n, ...(unit ? [Object.assign(document.createElement("small"), { textContent: unit })] : []));
+  }
+
+  function notices(s) {
+    const items = [];
+    if (offline) items.push(["This page lost its connection to the dashboard server.", "Retrying every few seconds."]);
+    if (s && s.demo) items.push(["Simulated data.", "Start the dashboard without --demo to show live plants."]);
+    if (s && s.error) items.push(["Felicity could not be reached.",
+      (s.updated ? `Values shown are from ${clock(s.updated)}. ` : "") + "Reason: " + s.error]);
+    if (s && s.unmatched.length) items.push(["Not found in the portal:", s.unmatched.join(", ") + ". Check watchlist.txt."]);
+    $("notices").replaceChildren(...items.map(([head, rest]) => {
+      const d = document.createElement("div"); d.className = "notice";
+      d.append(Object.assign(document.createElement("b"), { textContent: head }), " " + rest);
+      return d;
+    }));
+  }
+
+  function render(s) {
+    const host = $("plants"), seen = new Set();
+    let pv = null, load = null, batt = null, reporting = 0;
+    const add = (acc, v) => v == null ? acc : (acc || 0) + v;
+    s.plants.forEach((p, i) => {
+      let card = cards.get(p.plantId);
+      if (!card) { card = makeCard(p); cards.set(p.plantId, card); }
+      if (host.children[i] !== card.el) host.insertBefore(card.el, host.children[i] || null);
+      const st = update(card, p, s);
+      seen.add(p.plantId);
+      if (st === "ok" || st === "check") reporting++;
+      pv = add(pv, p.pv_W); load = add(load, p.load_W); batt = add(batt, p.batt_W);
+    });
+    for (const [id, card] of cards) if (!seen.has(id)) { card.el.remove(); cards.delete(id); }
+
+    figure($("t-pv"), pv); figure($("t-load"), load); figure($("t-batt"), batt);
+    $("t-batt-label").textContent = batt == null || Math.abs(batt) < FLOW_MIN_W ? "Battery" : batt > 0 ? "Battery charging" : "Battery discharging";
+    $("t-count").replaceChildren(String(reporting), Object.assign(document.createElement("small"), { textContent: "of " + s.plants.length }));
+
+    const empty = $("empty");
+    empty.hidden = s.plants.length > 0 || s.updated == null && !s.error;
+    if (!empty.hidden) {
+      empty.replaceChildren("No watchlist plants to show. Add plant IDs or names to watchlist.txt, one per line. List them with ",
+        Object.assign(document.createElement("code"), { textContent: "python probe.py --list-plants" }), ".");
+    }
+    notices(s);
+  }
+
+  function freshness() {
+    const el = $("fresh");
+    if (!last) { el.textContent = offline ? "Not connected" : "Loading plants"; return; }
+    if (last.updated == null) { el.textContent = last.error ? "No data yet" : "Reading plants from Felicity"; return; }
+    const age = Math.max(0, Math.round(last.now - last.updated + (Date.now() - lastAt) / 1000));
+    const ago = age < 60 ? `${age} s ago` : age < 3600 ? `${Math.floor(age / 60)} min ago` : `at ${clock(last.updated)}`;
+    el.replaceChildren("Updated ", Object.assign(document.createElement("b"), { textContent: ago }),
+      last.refreshing ? ", refreshing now" : `, refreshes every ${last.refresh_s} s`);
+  }
+
+  async function poll() {
+    if (document.hidden) return;   // a background tab must not keep Felicity polling alive
+    try {
+      const r = await fetch("api/state", { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      last = await r.json(); lastAt = Date.now(); offline = false;
+      render(last);
+    } catch (e) {
+      offline = true;
+      notices(last);
+    }
+    freshness();
+  }
+
+  poll();
+  setInterval(poll, POLL_MS);
+  setInterval(freshness, 1000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
+})();
+</script>
+</body>
+</html>
