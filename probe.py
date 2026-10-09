@@ -37,6 +37,10 @@ Optional env:
     BATTERY_RESERVE_PCT  state of charge treated as empty when estimating
                          backup time (default 20)
 
+Savings: put the price of the electricity that solar replaces in savings.json
+next to this script (a default, and optionally one per plant). Each plant then
+reports money saved today, this month, this year and in total.
+
 Watchlist file: one plant per line, either a plantId or a plant name
 (case-insensitive; exact match first, then substring). `#` starts a comment.
 """
@@ -456,38 +460,53 @@ def positive(v) -> float | None:
     return v if v and v > 0 else None
 
 
-def module_count(snap: dict) -> int:
-    """Battery modules in series inside one device: 1 for a 48 V pack, 10 for a
-    typical high-voltage stack (FLH series).
+MODULE_V_TYPICAL = 53.5  # a 16-cell LFP module sits near this over most of its working range
+COUNT_BASIS = {
+    "reported": "count reported by the stack",
+    "sibling": "count taken from a sister stack at the same voltage",
+    "limits": "count from the stack's voltage limits",
+    "voltage": "count estimated from stack voltage, may be off by one",
+}
 
-    The stack voltage divided by the module voltage gives a rough count, which
-    drifts with state of charge, so an explicit count from the snapshot is used
-    when it agrees with that ratio to within 25 %.
+
+def module_count(snap: dict) -> tuple[int, str]:
+    """(modules in series inside one battery device, how that was established).
+
+    1 for a 48 V pack; 10 or 12 for the high-voltage stacks seen so far. An
+    explicit count from the snapshot is used when it agrees with stack voltage
+    / module voltage to within 25 %. Some stacks report a count of 0; for those
+    the midpoint of the BMS charge and discharge voltage limits is tried, then
+    the stack voltage itself, which drifts with state of charge.
+    watch_plant() later replaces such estimates with a sister stack's count.
     """
     volt = positive(snap.get("volt")) or NOMINAL_PACK_V
     stack_v = positive(first(snap, "battVolt", "emsVoltage"))
     listed = snap.get("bmsVoltageList")
     listed = sum(1 for v in map(num, listed) if v and 20 < v < 100) if isinstance(listed, list) else 0
     if stack_v is None:
-        return listed if listed >= 2 and listed == num(snap.get("batCount")) else 1
+        return (listed, "reported") if listed >= 2 and listed == num(snap.get("batCount")) else (1, "single")
     ratio = stack_v / volt
     if ratio < 1.5:
-        return 1
+        return 1, "single"
     for count in (listed, num(snap.get("batCount")), num(snap.get("cellNumber"))):
         if count and 0.75 * ratio <= count <= 1.25 * ratio:
-            return int(count)
-    return max(round(ratio), 1)
+            return int(count), "reported"
+    high, low = positive(snap.get("BMSLCVolt")), positive(snap.get("BMSLDVolt"))
+    if high and low:
+        count = round((high + low) / 2 / volt)
+        if count >= 2 and 0.75 * ratio <= count <= 1.25 * ratio:
+            return count, "limits"
+    return max(round(stack_v / MODULE_V_TYPICAL), 1), "voltage"
 
 
 def battery_energy(snap: dict, row: dict) -> dict:
-    """Rated and stored energy of one battery device.
+    """Per-module energy, module count and state of charge of one battery device.
 
     Felicity's `ratedEnergy` is per module, so a high-voltage stack is
-    `ratedEnergy` x modules in series. Stored energy is rated x present state
-    of charge; the portal's own `remainingBatteryEnergy` is not used because it
-    is often missing or stale.
+    `ratedEnergy` x modules in series. finish_battery() turns this into rated
+    and stored energy once the module count is settled.
     """
-    modules = module_count(snap)
+    modules, basis = module_count(snap)
     per_module = positive(snap.get("ratedEnergy"))
     source = None
     if per_module and per_module > 1000:  # reported in Wh
@@ -506,12 +525,20 @@ def battery_energy(snap: dict, row: dict) -> dict:
             volt = positive(snap.get("volt")) or NOMINAL_PACK_V
             per_module = ah * volt / 1000
             source = f"{ah:g} Ah {'from the model name' if from_model else 'reported'} x {volt:g} V"
-    rated = per_module * modules if per_module else None
-    if rated and modules > 1:
-        source += f" per module x {modules} modules in series"
-    soc = num(first(snap, "emsSoc", "battSoc"))
-    return {"rated": rated, "modules": modules, "rated_from": source,
-            "remaining": rated * soc / 100 if rated is not None and soc is not None else None}
+    return {"per_module": per_module, "source": source, "modules": modules, "basis": basis,
+            "stack_v": positive(first(snap, "battVolt", "emsVoltage")),
+            "soc": num(first(snap, "emsSoc", "battSoc"))}
+
+
+def finish_battery(e: dict) -> dict:
+    """Rated and stored energy. Stored is rated x present state of charge; the
+    portal's own `remainingBatteryEnergy` is often missing or stale."""
+    rated = e["per_module"] * e["modules"] if e["per_module"] else None
+    source = e["source"]
+    if rated and e["modules"] > 1:
+        source += f" per module x {e['modules']} modules in series ({COUNT_BASIS[e['basis']]})"
+    return {"rated": rated, "rated_from": source,
+            "remaining": rated * e["soc"] / 100 if rated is not None and e["soc"] is not None else None}
 
 
 def device_offline(snap: dict, row: dict) -> tuple[bool, str | None]:
@@ -529,6 +556,77 @@ def device_offline(snap: dict, row: dict) -> tuple[bool, str | None]:
     epoch_ms = num(snap.get("dataTime"))
     too_old = epoch_ms is not None and time.time() - epoch_ms / 1000 > STALE_AFTER_S
     return status == "OL" or too_old, stamp
+
+
+# --- savings ------------------------------------------------------------------
+# Money saved = solar energy used on site x the price of the electricity it
+# replaced (grid tariff, or generator cost for an off-grid site), plus any
+# payment for exported energy. Solar used on site = generation - export.
+
+SAVINGS_FILE = Path(__file__).resolve().parent / "savings.json"
+PERIODS = ("today", "month", "year", "total")
+PV_ENERGY_KEYS = {
+    "today": ("ePvToday", "epvToday", "eToday", "etoday"),
+    "month": ("ePvMonth", "epvMonth"),
+    "year": ("ePvYear", "epvYear"),
+    "total": ("ePvTotal", "epvTotal"),
+}
+EXPORT_ENERGY_KEYS = {
+    "today": ("eGridFeedToday", "egridFeedToday"),
+    "month": ("eGridFeedMonth", "egridFeedMonth"),
+    "year": ("eGridFeedYear", "egridFeedYear"),
+    "total": ("eGridFeedTotal", "egridFeedTotal"),
+}
+_savings_cache: dict = {"mtime": None, "cfg": {}}
+
+
+def load_savings_config() -> dict:
+    """savings.json as a dict; {} if missing or invalid. Re-read when the file changes."""
+    try:
+        mtime = SAVINGS_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if mtime != _savings_cache["mtime"]:
+        try:
+            cfg = json.loads(SAVINGS_FILE.read_text())
+            if not isinstance(cfg, dict):
+                raise ValueError("expected a JSON object")
+        except (OSError, ValueError) as err:
+            log(f"savings.json ignored: {err}")
+            cfg = {}
+        _savings_cache.update(mtime=mtime, cfg=cfg)
+    return _savings_cache["cfg"]
+
+
+def plant_tariff(cfg: dict, pid: str, name: str) -> float | None:
+    """Price per kWh for one plant: its own entry (by plantId or name), else the default."""
+    plants = cfg.get("plants") if isinstance(cfg.get("plants"), dict) else {}
+    entry = plants.get(pid)
+    if entry is None:
+        entry = next((v for k, v in plants.items() if str(k).strip().lower() == name.strip().lower()), None)
+    rate = entry.get("tariff_per_kwh") if isinstance(entry, dict) else entry
+    return positive(rate) or positive(cfg.get("default_tariff_per_kwh"))
+
+
+def plant_savings(pid: str, name: str, pv: dict, export: dict) -> dict | None:
+    """Money saved per period, or None when no tariff is set for the plant."""
+    cfg = load_savings_config()
+    tariff = plant_tariff(cfg, pid, name)
+    if tariff is None:
+        return None
+    export_rate = positive(cfg.get("export_rate_per_kwh")) or 0.0
+    out = {"currency": str(cfg.get("currency") or "GHS"), "tariff_per_kwh": tariff,
+           "export_rate_per_kwh": export_rate}
+    for period in PERIODS:
+        generated = pv.get(period)
+        if generated is None:
+            out[period] = out[f"{period}_used_kWh"] = None
+            continue
+        exported = min(max(export.get(period) or 0.0, 0.0), generated)
+        used = generated - exported
+        out[period] = round(used * tariff + exported * export_rate, 2)
+        out[f"{period}_used_kWh"] = round(used, 1)
+    return out
 
 
 def unit_factor(row: dict) -> float:
@@ -573,7 +671,7 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
             return None if v is None else v * k
 
         mode = first(snap, "workModeStr", "operMStr")
-        energy = battery_energy(snap, r) if is_pack else {"rated": None, "remaining": None}
+        energy = battery_energy(snap, r) if is_pack else None
         rec = {
             "pv": w("pvTotalPower", "pvPower"),
             "grid": w("acTtlInpower"),
@@ -582,8 +680,12 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
             "soc": num(first(snap, "emsSoc", "battSoc")),
             "pv_today": num(first(snap, "ePvToday", "epvToday", "eToday", "etoday")),
             "mode": mode if mode not in (None, "-") else None,
-            "rated": energy["rated"],
-            "remaining": energy["remaining"],
+            "rated": None,
+            "remaining": None,
+            "pv_energy": {p: num(first(snap, *PV_ENERGY_KEYS[p])) for p in PERIODS},
+            "export_energy": {p: num(first(snap, *EXPORT_ENERGY_KEYS[p])) for p in PERIODS},
+            "energy": energy,
+            "entry": entry,
         }
         (packs if is_pack else inverters).append(rec)
         if first(snap, "warnMsg"):
@@ -591,13 +693,27 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
         # per-device breakdown, so every plant total can be traced to its inputs
         entry.update(soc=rec["soc"], batt_W=rec["batt"])
         if is_pack:
-            entry.update(rated_kWh=energy["rated"], stored_kWh=energy["remaining"],
-                         modules=energy["modules"], rated_from=energy["rated_from"],
-                         reported={key: snap.get(key) for key in
-                                   ("ratedEnergy", "capacity", "volt", "battVolt", "batCount", "cellNumber",
-                                    "remainingBatteryEnergy", "battSoh")})
+            entry["reported"] = {key: snap.get(key) for key in
+                                 ("ratedEnergy", "capacity", "volt", "battVolt", "batCount", "cellNumber",
+                                  "BMSLCVolt", "BMSLDVolt", "remainingBatteryEnergy", "battSoh")}
         else:
             entry.update(pv_W=rec["pv"], load_W=rec["load"], grid_in_W=rec["grid"], pv_today_kWh=rec["pv_today"])
+
+    # Stacks in parallel on one DC bus have the same number of modules in series.
+    # Where a stack did not report its count, take it from a sister stack whose
+    # voltage is within 5 % rather than trust a voltage-based estimate.
+    trusted = [x["energy"] for x in packs if x["energy"]["basis"] == "reported" and x["energy"]["stack_v"]]
+    for x in packs:
+        e = x["energy"]
+        if e["basis"] in ("limits", "voltage") and e["stack_v"]:
+            near = [t for t in trusted if abs(t["stack_v"] - e["stack_v"]) <= 0.05 * e["stack_v"]]
+            if near:
+                e["modules"] = min(near, key=lambda t: abs(t["stack_v"] - e["stack_v"]))["modules"]
+                e["basis"] = "sibling"
+        done = finish_battery(e)
+        x["rated"], x["remaining"] = done["rated"], done["remaining"]
+        x["entry"].update(rated_kWh=done["rated"], stored_kWh=done["remaining"],
+                          modules=e["modules"], rated_from=done["rated_from"])
 
     def total(recs, key):
         vals = [x[key] for x in recs if x[key] is not None]
@@ -616,6 +732,12 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
     reserve, backup = reserve_pct(), None
     if rated and remaining is not None and load and load >= 50:
         backup = round(max(remaining - rated * reserve / 100, 0) / (load / 1000), 1)
+    def energy_sum(field: str, period: str):
+        vals = [x[field][period] for x in inverters if x[field][period] is not None]
+        return round(sum(vals), 2) if vals else None
+
+    pv_energy = {p: energy_sum("pv_energy", p) for p in PERIODS}
+    export_energy = {p: energy_sum("export_energy", p) for p in PERIODS}
     stamps = sorted(o["since"] for o in offline if o["since"])
     return {
         "plantId": pid,
@@ -630,6 +752,8 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
         "batt_remaining_kWh": None if remaining is None else round(remaining, 1),
         # online packs with no usable capacity figure, plus packs that returned an error
         "batt_capacity_unknown": sum(x["rated"] is None for x in packs) + pack_errors,
+        # stacks whose module count rests on voltage alone and may be off by one
+        "batt_count_estimated": sum(x["energy"]["basis"] == "voltage" for x in packs),
         "backup_h": backup,
         "reserve_pct": reserve,
         "status": tally(r.get("status") for r in devices),
@@ -641,6 +765,9 @@ def watch_plant(portal: FelicityPortal, pid: str, rows: list[dict]) -> dict:
         "soc_avg": round(sum(soc) / len(soc), 1) if soc else None,
         "soc_min": min(soc) if soc else None,
         "pv_today_kWh": total(inverters, "pv_today"),
+        "pv_energy_kWh": pv_energy,
+        "export_energy_kWh": export_energy,
+        "savings": plant_savings(pid, plant_name(rows), pv_energy, export_energy),
         "warnings": warnings,
         "errors": errors,
         "devices": detail,
@@ -672,7 +799,15 @@ def format_plant(p: dict) -> str:
                 line += f" | Backup ~{p['backup_h']:.1f} h at this load (to {p['reserve_pct']:.0f}%)"
             if p.get("batt_capacity_unknown"):
                 line += f" | capacity unknown for {p['batt_capacity_unknown']} pack(s)"
+            if p.get("batt_count_estimated"):
+                line += f" | module count estimated for {p['batt_count_estimated']} stack(s)"
             lines.append(line)
+        saved = p.get("savings")
+        if saved and (saved["today"] is not None or saved["month"] is not None):
+            def money(v):
+                return "-" if v is None else f"{saved['currency']} {v:,.0f}"
+            lines.append(f"  Saved today {money(saved['today'])} | this month {money(saved['month'])} "
+                         f"(at {saved['currency']} {saved['tariff_per_kwh']:g}/kWh)")
         lines += [f"  OFFLINE {o['kind']} {o['model'] or ''} {o['sn']}, last data {o['since'] or 'unknown'}"
                   for o in p.get("offline_devices") or []]
     lines += [f"  WARNING {w}" for w in p["warnings"]]

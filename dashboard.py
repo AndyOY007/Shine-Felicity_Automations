@@ -160,7 +160,7 @@ class DemoSource:
         plant = {"plantId": pid, "plant": name, "inverters": inv, "batteries": batt,
                  "status": f"NMx{inv + batt}", "mode": "Off-Grid Mode", "warnings": [], "errors": [],
                  "batt_capacity_unknown": 0, "reserve_pct": 20.0,
-                 "offline": False, "offline_devices": [], "last_data": None}
+                 "offline": False, "offline_devices": [], "last_data": None, "savings": None}
         if kind == "dead":
             plant.update(pv_W=None, load_W=None, grid_in_W=None, batt_W=None, soc_avg=None,
                          soc_min=None, pv_today_kWh=None, mode=None, status="OLx2",
@@ -183,6 +183,13 @@ class DemoSource:
         if kind == "warn":
             plant["warnings"] = ["020308004825210463: PV2 low voltage"]
             plant["batt_capacity_unknown"] = 1
+        day_of_month = time.localtime().tm_mday
+        today = plant["pv_today_kWh"]
+        month = round(today + 38.0 * inv * (day_of_month - 1), 1)
+        plant["savings"] = {"currency": "GHS", "tariff_per_kwh": 1.85, "export_rate_per_kwh": 0.0,
+                            "today": round(today * 1.85, 2), "today_used_kWh": today,
+                            "month": round(month * 1.85, 2), "month_used_kWh": month,
+                            "year": None, "year_used_kWh": None, "total": None, "total_used_kWh": None}
         rated = 10.0 * batt
         remaining = rated * plant["soc_avg"] / 100
         plant.update(batt_rated_kWh=rated, batt_remaining_kWh=round(remaining, 1),

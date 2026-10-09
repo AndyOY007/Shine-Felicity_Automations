@@ -102,7 +102,8 @@
   .foot-label { color: var(--ink-2); font-size: 13px; }
   .foot-value { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .foot-value small { font-size: 13px; font-weight: 400; color: var(--ink-2); margin-left: 6px; }
-  .side + .side { text-align: right; }
+  .side.r { text-align: right; }
+  .save-note { grid-column: 1 / -1; margin: -6px 0 0; color: var(--ink-3); font-size: 12px; }
   .meter { --fill: var(--batt); height: 6px; margin-top: 6px; border-radius: 3px; overflow: hidden;
            background: color-mix(in srgb, var(--fill) 26%, var(--panel)); }
   .meter i { display: block; height: 100%; width: 0; border-radius: 3px; background: var(--fill); transition: width 0.6s ease; }
@@ -144,6 +145,7 @@
     <div class="total"><div class="total-label">Load now</div><div class="total-value" id="t-load">&ndash;</div></div>
     <div class="total"><div class="total-label" id="t-batt-label">Battery</div><div class="total-value" id="t-batt">&ndash;</div></div>
     <div class="total"><div class="total-label">Energy stored</div><div class="total-value" id="t-stored">&ndash;</div></div>
+    <div class="total" id="t-saved-tile" hidden><div class="total-label">Saved this month</div><div class="total-value" id="t-saved">&ndash;</div></div>
     <div class="total"><div class="total-label">Plants reporting</div><div class="total-value" id="t-count">&ndash;</div></div>
   </section>
 
@@ -196,10 +198,19 @@
         <div class="foot-label backup-label">Backup at this load</div>
         <div class="foot-value backup-value">&ndash;</div>
       </div>
-      <div class="side">
+      <div class="side r">
         <div class="foot-label">Solar today</div>
         <div class="foot-value today-value">&ndash;</div>
       </div>
+      <div class="side save" hidden>
+        <div class="foot-label">Saved today</div>
+        <div class="foot-value save-today">&ndash;</div>
+      </div>
+      <div class="side r save" hidden>
+        <div class="foot-label">Saved this month</div>
+        <div class="foot-value save-month">&ndash;</div>
+      </div>
+      <p class="save-note save" hidden></p>
     </div>
     <ul class="issues"></ul>
   </article>
@@ -222,6 +233,7 @@
   const powerText = v => power(v).join(" ").trim();
   const clock = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const kwh = v => v >= 100 ? String(Math.round(v)) : v.toFixed(1);
+  const money = (v, currency) => v == null ? "\u2013" : `${currency} ${Math.round(v).toLocaleString("en")}`;
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
   function stateOf(p) {
@@ -242,6 +254,7 @@
     const card = { el, name: q(".plant-name"), meta: q(".plant-meta"), chipIcon: q(".chip use"), chipLabel: q(".chip-label"),
       svg: q(".flow"), soc: q(".soc-value"), socNote: q(".soc-note"), meter: q(".meter"), bar: q(".meter i"),
       today: q(".today-value"), backup: q(".backup-value"), backupLabel: q(".backup-label"),
+      save: el.querySelectorAll(".save"), saveToday: q(".save-today"), saveMonth: q(".save-month"), saveNote: q(".save-note"),
       issues: q(".issues"), nodes: {}, flows: {} };
     for (const k of ["pv", "grid", "batt", "load"]) {
       card.nodes[k] = { g: node(k), label: node(k).querySelector(".n-label"), value: node(k).querySelector(".n-value") };
@@ -300,6 +313,16 @@
     card.meter.style.setProperty("--fill", floor == null ? "var(--line)" : floor < 10 ? "var(--crit)" : floor < LOW_SOC ? "var(--warn)" : "var(--batt)");
     card.today.textContent = p.pv_today_kWh == null ? "–" : p.pv_today_kWh.toFixed(1) + " kWh";
 
+    // Savings: solar energy used on site x the tariff set for this plant in savings.json.
+    const sv = st === "offline" ? null : p.savings;
+    card.save.forEach(e => { e.hidden = !sv; });
+    if (sv) {
+      card.saveToday.textContent = money(sv.today, sv.currency);
+      card.saveMonth.textContent = money(sv.month, sv.currency);
+      card.saveNote.textContent = `At ${sv.currency} ${sv.tariff_per_kwh} per kWh of solar used on site` +
+        (sv.month_used_kWh != null ? `, ${Math.round(sv.month_used_kWh).toLocaleString("en")} kWh this month` : "");
+    }
+
     const issues = [];
     if (low != null && low < LOW_SOC) issues.push(`Lowest battery pack is at ${Math.round(low)}%`);
     if (p.offline) issues.push(`Not reporting. Last data received ${p.last_data || "at an unknown time"}`);
@@ -325,6 +348,8 @@
     if (s && s.demo) items.push(["Simulated data.", "Start the dashboard without --demo to show live plants."]);
     if (s && s.error) items.push(["Felicity could not be reached.",
       (s.updated ? `Values shown are from ${clock(s.updated)}. ` : "") + "Reason: " + s.error]);
+    if (s && !s.demo && s.plants.some(p => !p.pending && !p.offline) && !s.plants.some(p => p.savings))
+      items.push(["Savings are hidden.", "Set a tariff in savings.json to show the money each plant has saved."]);
     if (s && s.unmatched.length) items.push(["Not found in the portal:", s.unmatched.join(", ") + ". Check watchlist.txt."]);
     $("notices").replaceChildren(...items.map(([head, rest]) => {
       const d = document.createElement("div"); d.className = "notice";
@@ -335,7 +360,7 @@
 
   function render(s) {
     const host = $("plants"), seen = new Set();
-    let pv = null, load = null, batt = null, stored = null, rated = null, reporting = 0;
+    let pv = null, load = null, batt = null, stored = null, rated = null, reporting = 0, saved = null, currency = "GHS", priced = 0;
     const add = (acc, v) => v == null ? acc : (acc || 0) + v;
     s.plants.forEach((p, i) => {
       let card = cards.get(p.plantId);
@@ -345,6 +370,7 @@
       seen.add(p.plantId);
       if (st === "ok" || st === "check") reporting++;
       pv = add(pv, p.pv_W); load = add(load, p.load_W); batt = add(batt, p.batt_W);
+      if (p.savings && !p.offline) { priced++; currency = p.savings.currency; saved = add(saved, p.savings.month); }
       if (p.batt_rated_kWh) { rated = add(rated, p.batt_rated_kWh); stored = add(stored, p.batt_remaining_kWh); }
     });
     for (const [id, card] of cards) if (!seen.has(id)) { card.el.remove(); cards.delete(id); }
@@ -353,6 +379,8 @@
     $("t-batt-label").textContent = batt == null || Math.abs(batt) < FLOW_MIN_W ? "Battery" : batt > 0 ? "Battery charging" : "Battery discharging";
     $("t-stored").replaceChildren(...(rated == null ? ["\u2013"] : [stored == null ? "\u2013" : kwh(stored),
       Object.assign(document.createElement("small"), { textContent: `of ${kwh(rated)} kWh` })]));
+    $("t-saved-tile").hidden = priced === 0;
+    $("t-saved").replaceChildren(...(saved == null ? ["\u2013"] : [Object.assign(document.createElement("small"), { textContent: currency + " " }), Math.round(saved).toLocaleString("en")]));
     $("t-count").replaceChildren(String(reporting), Object.assign(document.createElement("small"), { textContent: "of " + s.plants.length }));
 
     const empty = $("empty");

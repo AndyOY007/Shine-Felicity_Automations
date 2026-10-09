@@ -1,0 +1,13 @@
+{
+  "currency": "GHS",
+  "default_tariff_per_kwh": 2.5,
+  "export_rate_per_kwh": 0,
+  "plants": {
+    "A2 Farms New": {"tariff_per_kwh": null},
+    "A2 old installation": {"tariff_per_kwh": null},
+    "We Wire Ghana Limited": {"tariff_per_kwh": null},
+    "Translight Office (Kumasi)": {"tariff_per_kwh": null},
+    "Translight": {"tariff_per_kwh": null},
+    "WAPCo": {"tariff_per_kwh": null}
+  }
+}

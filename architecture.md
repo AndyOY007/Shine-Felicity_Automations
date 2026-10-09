@@ -1,153 +1,173 @@
-# shine-felicity: architecture
+# Shine-Felicity automations: architecture
 
-Fleet monitoring and reporting for Translight's Felicity Solar installations, modelled on the existing FusionSolar notification system.
+Monitoring and reporting for Translight's Felicity Solar installations, modelled on the existing FusionSolar notification system.
 
-Last updated: 2026-10-06. Status: exploration. Only `probe.py` exists; everything under "Target design" is proposed and not yet built.
+Last updated: 2026-10-09. Status: the scheduled Telegram reports run as a systemd service on the Raspberry Pi (`tsl-server`). The live dashboard, battery energy figures and savings are built and tested against mocked data and samples of real responses; they have had limited use against the live portal. Fleet-wide alerting, stored history and client access are not built (section 11).
 
 ## 1. Purpose and scope
 
-The system polls the Felicity cloud for every plant visible to the Translight portal account, keeps a small history, sends Telegram alerts when a plant needs attention, and produces a daily summary. It is read-only. Changing inverter settings is out of scope, and the client must make that impossible rather than merely unused (see section 8).
+The system reads a chosen set of plants (the watchlist) from the Felicity cloud and presents them in two ways: a Telegram report sent on a weekday and weekend schedule, and a web dashboard showing an energy-flow panel per plant. For each plant it reports solar, load, grid and battery power, state of charge, battery energy stored and rated, estimated backup time, solar energy today and money saved.
+
+It is read-only. Nothing in the code changes an inverter setting. It does not yet watch the whole fleet, raise alerts on its own, or keep history.
 
 ## 2. Constraints
 
-The design follows from four facts established during exploration.
+The design follows from six facts established against the live system.
 
-The account has no OpenAPI privilege. Calls to the documented `/openApi/...` endpoints return `2001528 Insufficient permissions`. Until Felicity enables that, the system uses the same internal endpoints the web portal uses. These are undocumented and can change without notice, so every response is parsed defensively and a schema change must degrade to an alert, not a crash.
+The account has no OpenAPI privilege. Felicity's documented `/openApi/...` endpoints return `2001528 Insufficient permissions` for an ordinary portal account, so the system uses the internal endpoints the web portal itself calls. These are undocumented and can change without notice.
 
-The fleet is large. The account sees 518 devices: inverters, battery packs, and sub-entries whose serial number ends in `-1` or `-2`. A snapshot call per device, spaced one second apart, takes more than ten minutes per sweep. Per-device polling is therefore reserved for the few things only a snapshot can provide.
+The fleet is large. The account sees about 527 devices: inverters, battery packs, high-voltage battery stacks, and sub-entries whose serial number ends in `-1` or `-2`. A snapshot call per device, spaced one second apart, takes around ten minutes, which is why everything is built around a short watchlist.
 
-Rate limits are unknown. Nothing is published, so the poller stays slow, backs off on errors, and never runs sweeps concurrently.
+Rate limits are unknown. Neither the OpenAPI document nor the portal publishes one, so calls are spaced a second apart, never run concurrently, and the scheduler and dashboard both enforce minimum intervals.
 
-The account can write. Its permission tags include device setting rights, so a bug or a careless addition could alter a customer's inverter. The client is restricted to an allowlist of read endpoints.
+The account can write. Its permission tags include device-setting rights, so the code must never call anything but the three read endpoints in section 3.
+
+The portal keeps serving the last snapshot of a device that has stopped reporting. One plant returned a complete, plausible snapshot that was 66 days old. Offline devices therefore have to be detected and excluded, or stale values are shown as live.
+
+Devices upload every five minutes (`reportFreq` 300 in the snapshot). Reading more often than that returns the same data.
 
 ## 3. Data source
 
-Host: `https://shine-api.felicitysolar.com`. Errors are returned as HTTP 200 with a body-level `code`, so the client branches on the body, never the HTTP status alone.
+Host: `https://shine-api.felicitysolar.com`. Errors are returned as HTTP 200 with a body-level `code`, so the client branches on the body, never on the HTTP status alone.
 
 | Purpose | Call | Used for |
 |---|---|---|
 | Login | `POST /userlogin` | Token, sent as-is in the `authorization` header |
-| Device list | `POST /device/list_device_all_type` | Fleet sweep: plant, status, live power and SOC |
-| Snapshot | `POST /device/get_device_snapshot` | Per-device detail: daily energy, work mode, warnings |
-| OpenAPI data | `/openApi/data/...` | Blocked (2001528). Preferred source if access is granted |
+| Device list | `POST /device/list_device_all_type` | Plant membership, device status, power units, battery capacity field |
+| Snapshot | `POST /device/get_device_snapshot` | All live values, energy counters, battery detail, last data time |
+| OpenAPI | `/openApi/...` | Not used. Blocked for this account (2001528) |
 
-Login encrypts the password with RSA PKCS#1 v1.5 against a public key embedded in the portal's JavaScript bundle. The client scrapes that key and falls back to the key published in the OpenAPI document. The token is a JWT prefixed with `Bearer_`; its `exp` claim is read without verification to schedule re-login, and codes 998 and 999 trigger an immediate re-login and one retry. The token is cached on disk with mode 0600.
+Login encrypts the password with RSA PKCS#1 v1.5 against a public key embedded in the portal's JavaScript bundle. The client scrapes that key and falls back to the key published in the OpenAPI document, or uses `FELICITY_PUBKEY` if set. The token is a JWT prefixed with `Bearer_`; its `exp` claim is read without verification, the token is cached in `~/.felicity_token.json` with mode 0600, and body codes 998 and 999 trigger one re-login and retry.
 
-## 4. Data model
+The device list is paged at 50 rows, so a full sweep is 11 calls. Paging stops on the server's page count, on a page with no new serial numbers, or after 300 seconds.
 
-A device-list row carries everything needed for a plant-level view, which is why the list is the primary source.
+There is no enforced endpoint allowlist yet: `FelicityPortal.post()` accepts any path. Only the three calls above appear in the code, but a guard that rejects any other path is a planned hardening (section 11).
 
-| Field | Meaning | Notes |
-|---|---|---|
-| `plantId`, `plantName` | Plant membership | Grouping key is `plantId` |
-| `deviceSn`, `deviceModel`, `type`, `deviceType` | Identity | `deviceType` codes are undocumented; `OG` seen on an IVEM inverter |
-| `status` | Connection state | Codes undocumented; `OL` seen on a device with no live data |
-| `ratedPower` | Nameplate | kW for inverters (`8` for an IVEM8048) |
-| `pvTotalPower` + `pvTotalPowerUnit` | PV power | Unit is `W` or `kW` and must be applied |
-| `bmsPower` + `bmsPowerUnit`, `battSoc` | Battery | Present on both inverter and pack rows |
-| `totalPower` + `totalPowerUnit` | Unconfirmed | Load or inverter output; to be verified |
-| `ctAcTtlInPower` + unit | Grid power at CT | Sign convention to be verified |
-| `wkStateName`, `failCode` | Work mode, fault | |
-| `parentId`, `invDeviceSn` | Device hierarchy | Likely links packs and sub-entries to an inverter |
-
-Normalisation rules. All power values are converted to watts using the row's unit field; snapshots showed IVGM models reporting in kW while IVEM and T-REX report in W, so no value is trusted without its unit. Numeric fields arrive as strings or null and are parsed as optional floats.
-
-Aggregation rules per plant. PV, load and grid power are summed over inverter rows only. Battery power is summed over inverter rows, falling back to pack rows when no inverter reports it, because the inverter sees the whole bank while pack rows cover only monitored packs; parallel inverters each report their own share, so summing inverters is correct. State of charge is taken from pack rows, falling back to inverter rows, because an inverter without a BMS link reports 0 %. Both average and minimum SOC are kept; the minimum drives alerts.
-
-## 5. Target design
+## 4. Components
 
 ```mermaid
 flowchart LR
-    S[scheduler] --> C[client]
-    C -->|list sweep| N[normalise + aggregate]
-    C -->|snapshots, daily| N
-    N --> DB[(SQLite)]
-    DB --> R[rules]
-    R --> T[Telegram]
-    DB --> D[daily summary]
-    D --> T
-    H[healthcheck] --> T
+    CFG[(.env, watchlist.txt,<br>schedule.json, savings.json)]
+    S[scheduler.py] -->|runs on schedule| P[probe.py]
+    D[dashboard.py] -->|imports| P
+    CFG --> S
+    CFG --> P
+    P -->|login, device list, snapshots| F[Felicity portal API]
+    P -->|report and failure notices| T[Telegram]
+    D -->|JSON| B[dashboard.html in a browser]
 ```
 
-The layout mirrors the FusionSolar project so the two can be operated the same way.
+| File | Role |
+|---|---|
+| `probe.py` | Everything that touches Felicity and Telegram: login, device list, snapshots, per-plant aggregation, battery energy, savings, report formatting, Telegram delivery. Also the command-line tool |
+| `scheduler.py` | Runs `probe.py --watch <watchlist> --telegram` at the times in `schedule.json`. Standard library only |
+| `dashboard.py` | Web server and background poller. Imports `probe.py` for data and serves `dashboard.html` and `/api/state` |
+| `dashboard.html` | The page: one energy-flow panel per plant, totals row, status and notices. No external assets |
+| `watchlist.txt` | The plants to report, one per line, by `plantId` or name |
+| `schedule.json` | Weekday and weekend start, end and interval for the Telegram reports |
+| `savings.json` | Tariff per plant, or a default, used for the savings figures |
+| `.env` | Credentials and optional settings. Never committed |
+| `felicity-watch.service`, `felicity-dashboard.service` | systemd units for the Pi |
 
-| Module | Responsibility | State |
-|---|---|---|
-| `probe.py` | Exploration CLI: device sweep, `--plants`, `--watch` (watchlist report, optional Telegram), `--raw`, `--discover` | Exists |
-| `felicity/client.py` | Auth, token cache, retries, endpoint allowlist, list and snapshot calls | Planned (extract from `probe.py`) |
-| `felicity/model.py` | Row parsing, unit conversion, device classification | Planned |
-| `felicity/plants.py` | Grouping and the aggregation rules in section 4 | Planned (logic exists in `probe.py`) |
-| `felicity/store.py` | SQLite access | Planned |
-| `felicity/rules.py` | Alert evaluation and debounce | Planned |
-| `felicity/telegram_notify.py` | Message formatting and delivery | Planned |
-| `felicity/daily_summary.py` | End-of-day report | Planned |
-| `felicity/scheduler.py` | APScheduler jobs | Planned |
-| `felicity/healthcheck.py` | Self-monitoring and watchdog alert | Planned |
+`probe.py` loads `.env` itself, so cron and systemd need no shell wrapper. `probe.py` is one large file by history rather than design; splitting it into a client, a model and a reporting module is on the roadmap.
 
-Storage is a single SQLite file with four tables: `plant_state` (latest aggregate and consecutive-condition counters per plant), `samples` (one row per plant per sweep), `daily_energy` (one row per inverter per day), and `alerts` (open and closed alerts, which is what makes debounce and "resolved" messages possible). SQLite is sufficient at this write rate and keeps the Pi deployment to one process and one file.
+## 5. Data model
 
-## 6. Polling strategy
+Two sources are combined per device. The device-list row gives `plantId`, `plantName`, `deviceSn`, `deviceModel`, `status`, the unit of each power field (`pvTotalPowerUnit` and its siblings), and `battCapacity`. The snapshot gives every live value. Numeric fields arrive as strings or null and are parsed as optional floats.
 
-Three tiers keep the request count low.
+Device classification. A device is a battery if the list row carries a `battCapacity`, if its `deviceType` is `BP`, or if the snapshot's `productTypeEnum` is `LITHIUM_BATTERY_PACK`. Inverter rows leave `battCapacity` null. Everything else is an inverter. Sub-entries (`<serial>-1`, `-2`) duplicate their parent's battery data and are skipped.
 
-The fleet sweep pages through the device list at 50 rows per page: 11 calls for 518 devices, about 15 seconds with a one-second gap. Proposed interval is 10 minutes, which is 66 calls an hour. This feeds status, power, SOC and fault alerts.
+Units. Snapshots carry no unit, and models differ: IVGM hybrids report power in kW, IVEM and T-REX in W. Each device's snapshot powers are scaled by the unit its list row declares. This assumes the two endpoints use the same unit per device.
 
-The detail tier calls the snapshot endpoint only where the list is insufficient: once per inverter after sunset to record daily PV energy (`ePvToday` and its variants), and on demand for a plant that has just raised an alert, to attach work mode and warning text. Battery packs and sub-entries are skipped. Calls are spaced two seconds apart and the daily job is allowed to take as long as it needs.
+Status codes. `OL` is offline; this is confirmed by devices whose last data was days or weeks old. `NM` and `AL` are taken to mean normal and alarm; both return current data.
 
-The watchlist tier covers high-profile plants that need periodic updates regardless of alerts. `watchlist.txt` names them by `plantId` or plant name. Each run does one list sweep to resolve membership, status and units, then takes a snapshot of every device in the watched plants only, skipping `-N` sub-entries, and sends one Telegram report with PV, load, grid input, battery power, SOC, PV today, work mode and warnings per plant. Snapshots carry no unit field, so each device's values are scaled by the unit its device-list row declares; this assumes the two endpoints use the same unit per device and should be checked against the portal for one IVGM plant. This tier exists today as `probe.py --watch watchlist.txt --telegram`, run from cron.
+Offline detection. A device is offline if its status is `OL`, or if its snapshot is more than 12 hours old. The age test is only a backstop: the snapshot's numeric `dataTime` is 8 hours earlier than its text `dataTimeStr`, which matches local time, so age cannot be judged more finely than that. The text time is what is shown to users.
 
-If the list turns out not to carry live values for online devices (open question 1), the sweep falls back to snapshots for inverters only, grouped by plant, and the interval lengthens to match.
+Sign conventions. Grid power (`acTtlInpower`) is positive when importing, per the OpenAPI document. Battery power is positive when charging; this is inferred from live data, not documented.
 
-## 7. Alerts and reporting
+Snapshot fields in use:
 
-Proposed rules, all evaluated per plant on the aggregate and all subject to debounce. Thresholds are starting points to tune against real data.
+| Quantity | Fields, in order of preference |
+|---|---|
+| Solar power | `pvTotalPower`, `pvPower` |
+| Grid power | `acTtlInpower` |
+| Load power | `totalConsumPower`, `acTotalOutActPower` |
+| Battery power | `emsPower`, `bmsPower` |
+| State of charge | `emsSoc`, `battSoc` |
+| Work mode | `workModeStr`, `operMStr` |
+| Solar energy | `ePvToday`, `ePvMonth`, `ePvYear`, `ePvTotal` and lowercase variants |
+| Exported energy | `eGridFeedToday`, `eGridFeedMonth`, `eGridFeedYear`, `eGridFeedTotal` |
+| Battery energy | `ratedEnergy`, `capacity`, `volt`, `battVolt`, `batCount`, `cellNumber`, `bmsVoltageList`, `BMSLCVolt`, `BMSLDVolt` |
+| Last data | `dataTimeStr`, `dataTime`, `status` |
 
-| Rule | Condition | Debounce |
-|---|---|---|
-| Offline | No device in the plant reports live values | 3 consecutive sweeps |
-| Fault | Any `failCode` present | Immediate, once per code |
-| Low battery | Minimum SOC below 20 % | 2 consecutive sweeps |
-| No PV in daylight | PV is zero between 09:00 and 15:00 while online | 3 consecutive sweeps |
-| Recovered | An open alert's condition clears | 2 consecutive sweeps |
+## 6. Per-plant calculations
 
-Each alert is sent once when it opens and once when it closes. With several hundred plants, an unbounced per-sweep notification would make the channel unusable, so repeat suppression is a requirement, not a refinement.
+Offline devices and devices that return an error are excluded from every figure below and listed separately. A plant with no reporting device is marked offline with the time of its last data.
 
-The daily summary lists fleet PV energy for the day, plants offline or in fault, plants that hit low SOC, and the lowest-yield plants relative to rated power. Specific yield uses inverter `ratedPower` as a proxy until array kWp per plant is recorded, which the API does not provide.
+Power. Solar, load and grid power are summed over inverters. Battery power is summed over inverters, falling back to battery devices when no inverter reports it, because an inverter sees the whole bank while battery rows cover only monitored packs. Parallel inverters each report their own share, so summing is correct.
+
+State of charge is taken from battery devices, falling back to inverters. An inverter with no battery data link reports 0 %, so a plant with no battery devices whose inverters all read 0 % is shown as unknown. Both the average and the minimum are kept; the minimum drives the low-battery flag.
+
+Battery energy. Felicity's `ratedEnergy` is per module. A 48 V pack is one module (an FLA48500 reports 25 kWh). A high-voltage FLH stack is several 5.12 kWh modules in series, so its rated energy is `ratedEnergy` times the module count: 51.2 kWh for ten modules, 61.44 kWh for twelve. If `ratedEnergy` is absent, capacity in Ah times nominal voltage is used, then the Ah embedded in the model name.
+
+Module count is established in this order. The count the stack reports (`batCount`, `cellNumber`, or the number of module voltages listed) is used when it agrees with stack voltage divided by module voltage to within 25 %. Some stacks report a count of zero; those take the count of a sister stack in the same plant whose voltage is within 5 %, since stacks in parallel on one DC bus must have the same series count. Failing that, the midpoint of the BMS charge and discharge voltage limits divided by the nominal module voltage is used, and last the stack voltage divided by 53.5 V, which can be off by one module and is flagged.
+
+Stored energy is rated energy times present state of charge. The portal's `remainingBatteryEnergy` is not used; it is often missing or stale.
+
+Backup time is the energy above a reserve level divided by the present load: (stored − rated × reserve) ÷ load. The reserve defaults to 20 % (`BATTERY_RESERVE_PCT`). It assumes solar and grid stop now and load stays constant, and ignores inverter losses and state of health.
+
+Savings are solar energy used on site times the tariff in `savings.json`, plus exported energy times an export rate if one is set. Solar used on site is generation minus export, taken from the inverters' own today, month, year and lifetime counters, so no stored history is needed. Energy lost in the battery round trip is ignored, which makes the figure slightly optimistic.
+
+## 7. Scheduling and polling
+
+Telegram reports. `scheduler.py` computes run times from `schedule.json`: start, start plus interval, and so on up to and including end, separately for Monday to Friday and for Saturday and Sunday, in the configured timezone. It re-reads the file every 30 seconds, so edits apply without a restart, and keeps the previous schedule if the file is invalid. Each run is a child process, so a crash or hang in one run cannot stop the scheduler; a run that exceeds 15 minutes is killed and reported. A slot more than five minutes late is skipped, not sent late. The minimum interval is ten minutes.
+
+Dashboard. `dashboard.py` polls Felicity only while the page is open in a visible browser tab, and goes idle two minutes after the last request. Each cycle takes one snapshot per device in the watched plants. The device list, which gives plant membership, is re-read every 30 minutes, and an edit to `watchlist.txt` is picked up on the next cycle. The default cycle is 60 seconds with a minimum of 30; since devices upload every five minutes, 300 seconds loses little. The page itself asks the dashboard server for cached state every five seconds, which costs Felicity nothing.
+
+Cost per Telegram run: 11 device-list calls plus one snapshot per device in the watched plants, spaced one second apart.
 
 ## 8. Failure handling and security
 
-Network errors (timeouts, connection resets, DNS failures) are retried three times with exponential backoff. A sweep that still fails is recorded and skipped; it must not be reported as every plant going offline. The healthcheck raises a single Telegram alert after a set number of consecutive failed sweeps, and another on recovery.
+Network errors (timeouts, connection resets, DNS failures) are retried three times with backoff and logged. A device-list request rejected with a body-level error code stops the run with that code and message. A scheduled run that fails sends one Telegram notice with the reason, so reports never stop silently. Telegram errors never include the request URL, because it contains the bot token.
 
-Login failures are distinguished by code: 1002006 (wrong password, or a changed RSA key) and 1002001 (account not activated) stop the poller and alert, since retrying will not help. A response missing expected fields is logged with its keys and raises a "schema changed" alert.
+A device that returns no data is listed under the plant as "no data", and a battery in that state marks the plant's capacity as unknown, so totals are not understated without saying so.
 
-TLS verification stays on. The servers are reported to omit their intermediate certificate; if that causes failures on the Pi, the fix is a CA bundle containing the intermediate (`FELICITY_CA_BUNDLE`), never `verify=False`, because the login request carries the account password.
+TLS verification stays on. If Felicity's certificate chain fails to verify on some machine, the fix is a CA bundle (`FELICITY_CA_BUNDLE`), never disabling verification, because the login request carries the account password.
 
-Credentials live in an environment file readable only by the service user and are never committed. The client exposes only login, device list and snapshot; any other path raises before a request is made.
+Credentials live in `.env`, readable only by the service user, and are not committed. The dashboard is plain HTTP, listens on all interfaces by default, and has no password unless `DASHBOARD_PASSWORD` is set. It is meant for the private Tailscale network, not the internet. It serves only the page, the state JSON and a health check, sets a restrictive content security policy, and writes plant names into the page as text, never as HTML.
 
 ## 9. Deployment
 
-Target is the existing Raspberry Pi (`tsl-server`) as a second systemd service alongside the FusionSolar one, with its own virtual environment, working directory and environment file. The scheduler runs in `Africa/Accra`. Development and exploration happen on the MacBook with `probe.py`.
+Development happens on a MacBook. Production is the Raspberry Pi `tsl-server`, user `translight-iot`, project in `~/Shine-Felicity_Automations` with its own virtual environment, alongside the FusionSolar service. Python 3.10 or newer is required; the Pi runs 3.13. Two systemd units run the scheduler and the dashboard, both restarting on failure and starting at boot. Setup steps are in `README.md`.
 
-## 10. Open questions
+The Pi and any development machine share one portal account. Whether Felicity allows concurrent sessions is not known; each side simply logs in again if its token is rejected.
 
-These are unverified and block or shape the build. Items 1 to 4 are answered by one run of `probe.py --plants`.
+## 10. Known issues and open questions
 
-1. Does the device list carry live values for online devices? The only row inspected so far had every live field null.
-2. What do the `status` codes mean? `OL` is assumed to be offline.
-3. What are the `deviceType` codes, and is `BP` the battery-pack code the aggregation assumes?
-4. Is `totalPower` load or inverter output?
-5. What is the sign convention of `ctAcTtlInPower` and `bmsPower`? Snapshots suggest positive battery power is charging; the OpenAPI document says negative grid power is export.
-6. What are the `-1` and `-2` sub-entries, and should they be excluded from counts?
-7. When does the "today" energy counter reset? The list row showed a null `timeZone`, so a device with a wrong clock would misplace its daily total.
-8. What page size does the device list accept? 50 works; a larger page would cut the sweep further.
-9. How long does the portal token last?
-10. Will Felicity grant OpenAPI access? If so, `client.py` gains a second backend and the rest of the system is unchanged.
+Load is probably under-read on IVGM hybrid inverters. The power balance does not close on the IVGM50K plants: one showed 36.8 kW solar plus 3.4 kW grid against 16.9 kW load and 11.0 kW battery charging, leaving about 12 kW unaccounted for. A second load field is likely being missed. Backup time is overstated on those plants until this is fixed; savings are unaffected because they use generation.
 
-## 11. Build order
+The month, year and lifetime energy counters are unverified. Only the "today" counter has been seen in real data; the other field names come from a community integration.
 
-1. Resolve open questions 1 to 6 with `probe.py`.
-2. Extract `client.py`, `model.py` and `plants.py` from `probe.py`, with tests built from captured responses.
-3. Add `store.py` and the fleet sweep job; run it for several days without alerts to collect data.
-4. Tune thresholds against that data, then enable `rules.py` and Telegram delivery.
-5. Add the daily energy job and daily summary.
-6. Deploy to the Pi with the healthcheck.
+The unit assumption (snapshot values follow the device-list unit) has not been checked against the portal for an IVGM plant.
+
+The battery power sign convention is inferred, not documented.
+
+The module count of a lone stack that reports no count rests on voltage and may be off by one.
+
+Unknown: how long the portal token lasts, whether the device list accepts a page size above 50, whether two sessions can coexist, and when the "today" counter resets relative to local midnight.
+
+Open with Felicity: an OpenAPI account. With it, `probe.py` would gain a second, documented backend and the rest of the system would not change.
+
+## 11. Roadmap
+
+Fix the load reading on hybrid inverters, which needs one raw inverter snapshot to identify the missing field.
+
+Enforce the read-only endpoint allowlist in `FelicityPortal.post()`.
+
+Stored history: a small SQLite database on the Pi recording each plant reading. This enables power and energy charts, a grid-outage log, uptime, and a monthly report per client.
+
+Client-only view. The agreed approach is one secret link per client mapped to their plants in a config file, with filtering done on the server and internal detail (serial numbers, raw errors, diagnostics) removed. Client plants would be polled on a fixed five-minute schedule and served from a cache, so public visitors cannot drive load on the Felicity account. The page would be published through a tunnel (Tailscale Funnel, or a Cloudflare Tunnel on Translight's own domain), with the public side reading only the cache and never holding the Felicity credentials. Longer term, the Pi could push readings to a small hosted app so nothing public reaches the private network.
+
+Fleet-wide alerting: a periodic device-list sweep with debounced rules (offline, fault, low battery, no solar in daylight) and one message when an alert opens and one when it closes.
+
+Refactor `probe.py` into a client, a model and a reporting module, with tests built from captured responses.

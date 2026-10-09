@@ -1,5 +1,5 @@
 # systemd unit for the Felicity watchlist scheduler.
-# Assumes user translight-iot and the project at /home/translight-iot/shine-felicity
+# Paths match the Pi: user translight-iot, project in ~/Shine-Felicity_Automations,
 # with a virtualenv in .venv. Change the three paths below if yours differ.
 #
 #   sudo cp felicity-watch.service /etc/systemd/system/
@@ -15,8 +15,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=translight-iot
-WorkingDirectory=/home/translight-iot/shine-felicity
-ExecStart=/home/translight-iot/shine-felicity/.venv/bin/python /home/translight-iot/shine-felicity/scheduler.py
+WorkingDirectory=/home/translight-iot/Shine-Felicity_Automations
+ExecStart=/home/translight-iot/Shine-Felicity_Automations/.venv/bin/python /home/translight-iot/Shine-Felicity_Automations/scheduler.py
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=30
